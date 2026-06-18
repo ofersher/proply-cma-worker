@@ -1,0 +1,4 @@
+# Shell scripts MUST stay LF — a CRLF start.sh breaks bash on the Linux runtime
+# ($'\r': command not found / bad interpreter). This machine's autocrlf would
+# otherwise risk CRLF contamination.
+*.sh text eol=lf

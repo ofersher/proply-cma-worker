@@ -18,5 +18,7 @@ COPY . .
 
 EXPOSE 8080
 
-# xvfb-run gives the HEADED browser a virtual display inside the container.
-CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x1024x24", "npx", "tsx", "src/index.ts"]
+# Start Xvfb in the background (DISPLAY :99) then exec node — avoids xvfb-run's
+# display-lock negotiation, which hung the container on Railway before node ran.
+# Invoked via `bash` so it works regardless of the file's executable bit.
+CMD ["bash", "start.sh"]
