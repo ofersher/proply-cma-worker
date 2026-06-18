@@ -88,6 +88,8 @@ async function doFetch(
   let buffer: RawDeal[] | null = null;
   let totalRows: number | null = null;
   let yearApplied = false;
+  let tokenVerify = "(none)"; // diagnostic — did the SITE's reCAPTCHA token pass from this egress IP?
+  let capturedRows = 0; // diagnostic — rows in the captured buffer (avoids TS closure-narrowing on `buffer`)
 
   const startedAt = Date.now();
   const elapsed = (): number => Date.now() - startedAt;
@@ -109,6 +111,20 @@ async function doFetch(
 
     page.on("response", async (res) => {
       const u = res.url();
+      // Diagnostic: the SITE's own grecaptcha token is verified here. 200/ok ⇒ the
+      // egress IP scored fine and deal-data will follow; 400/fail ⇒ reCAPTCHA
+      // rejected this IP (datacenter low score) and deal-data never fires. We only
+      // READ this — we never mint/recycle the token.
+      if (u.includes("/token-verify")) {
+        try {
+          const ok = (JSON.parse((await res.body()).toString("utf8")) as { ok?: unknown }).ok;
+          tokenVerify = `${res.status()}:${ok ? "ok" : "fail"}`;
+        } catch {
+          tokenVerify = String(res.status());
+        }
+        log.info({ settlementId, attempt, tokenVerify }, "token-verify");
+        return;
+      }
       if (!u.includes("/deal-data")) return;
       if (res.status() === 403) {
         got403 = true; // user-limit — back off, no evasion
@@ -120,8 +136,10 @@ async function doFetch(
         const items = extractItems(env);
         if (items.length) {
           buffer = items;
+          capturedRows = items.length;
           totalRows = env?.data?.total_rows ?? totalRows;
           if (phaseYear) yearApplied = true;
+          log.info({ settlementId, attempt, rows: items.length, phaseYear }, "deal-data captured");
         }
       } catch {
         /* keep waiting */
@@ -161,6 +179,21 @@ async function doFetch(
     // a single in-flight request and blew the budget. Skip it near the deadline.
     if (attempt < config.maxRetries && elapsed() < WORKER_DEADLINE_MS) await sleep(RETRY_GAP_MS);
   }
+
+  // Diagnostic summary — Railway logs show whether the (proxied) egress IP made
+  // the SITE's reCAPTCHA pass and whether the deal-data buffer was captured.
+  log.info(
+    {
+      settlementId,
+      proxied: Boolean(config.proxyServer),
+      tokenVerify,
+      dealDataFired: capturedRows > 0,
+      rows: capturedRows,
+      got403,
+      elapsedMs: elapsed(),
+    },
+    "deal-data: doFetch summary"
+  );
 
   if (!buffer) {
     return {

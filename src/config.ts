@@ -18,6 +18,11 @@ export const config = {
   port: num("PORT", 8080),
   /** Bearer secret for POST /comparables. /health is public. */
   secret: process.env.CMA_WORKER_SECRET ?? "",
+  // PART A — optional residential/ISP egress proxy (egress IP only; the SITE
+  // still mints its own reCAPTCHA token). Unset = direct connection.
+  proxyServer: process.env.PROXY_SERVER ?? "",
+  proxyUsername: process.env.PROXY_USERNAME ?? "",
+  proxyPassword: process.env.PROXY_PASSWORD ?? "",
   maxConcurrency: num("MAX_CONCURRENCY", 1),
   fetchDelayMs: num("FETCH_DELAY_MS", 2750),
   cooldownMs: num("COOLDOWN_MS", 30_000),

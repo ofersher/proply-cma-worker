@@ -1,4 +1,5 @@
 import { chromium, type Browser } from "playwright";
+import { config } from "./config.js";
 import { log } from "./log.js";
 
 /**
@@ -17,16 +18,33 @@ let browser: Browser | null = null;
 
 export async function launchBrowser(): Promise<void> {
   if (browser?.isConnected()) return;
+
+  // PART A — route the browser's outbound through a residential/ISP proxy when
+  // PROXY_SERVER is set. EGRESS IP ONLY: the real headed browser still loads the
+  // real page and the SITE mints its own reCAPTCHA token — we never call
+  // grecaptcha, recycle a token, build ##, or patch the fingerprint. Set at
+  // launch so EVERY context uses the SAME static IP → sticky per report, no
+  // mid-session rotation (which would break deal-info→token-verify→deal-data).
+  // Unset = direct connection (unchanged behaviour).
+  const proxy = config.proxyServer
+    ? {
+        server: config.proxyServer,
+        username: config.proxyUsername || undefined,
+        password: config.proxyPassword || undefined,
+      }
+    : undefined;
+
   browser = await chromium.launch({
     headless: false,
     // --no-sandbox is required to run Chromium as root in the container.
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    ...(proxy ? { proxy } : {}),
   });
   browser.on("disconnected", () => {
     browser = null;
     log.warn("browser disconnected");
   });
-  log.info("browser launched (headed, under xvfb)");
+  log.info({ proxy: proxy ? config.proxyServer : "none" }, "browser launched (headed, under xvfb)");
 }
 
 export function isBrowserUp(): boolean {
