@@ -12,6 +12,18 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+// CP-FIX-1 — speed/safety budget. doFetch self-caps at WORKER_DEADLINE_MS so it
+// ALWAYS returns a 200 (with whatever it has) before the Vercel client's
+// CMA_WORKER_TIMEOUT_MS (90s) aborts → never a 499. Navigation uses
+// domcontentloaded (the nadlan SPA never reaches networkidle → that was the
+// up-to-60s goto stall). The scroll loop breaks the instant deal-data lands.
+// NOTE: config.fetchDelayMs / config.cooldownMs are no longer used here — the
+// 30s cooldown previously blocked a single in-flight request and blew the budget.
+const WORKER_DEADLINE_MS = 80_000; // hard overall budget across all attempts
+const SCROLL_ITERATIONS = 8; // was 14
+const SCROLL_DELAY_MS = 1500; // scroll poll wait (was config.fetchDelayMs = 2750)
+const RETRY_GAP_MS = 2000; // tiny gap between attempts (NOT the 30s cooldown)
+
 export interface FetchResult {
   comparables: NadlanComparable[]; // near-subject, room+street+sqm matched, last 12mo
   settlement_sample: NadlanComparable[]; // room-matched buffer (aggregate band)
@@ -72,13 +84,25 @@ async function doFetch(
   const cutoff = isoMonthsAgo(monthsBack ?? config.monthsBack);
 
   let got403 = false;
-  let consecutiveMisses = 0;
   let pagesFetched = 0;
   let buffer: RawDeal[] | null = null;
   let totalRows: number | null = null;
   let yearApplied = false;
 
+  const startedAt = Date.now();
+  const elapsed = (): number => Date.now() - startedAt;
+
   for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
+    // Hard overall budget: never start an attempt that could run past the worker
+    // deadline (and so past the Vercel client timeout → 499). Return what we have.
+    if (elapsed() >= WORKER_DEADLINE_MS) {
+      log.warn(
+        { settlementId, attempt, elapsedMs: elapsed() },
+        "deal-data: worker deadline reached — returning what we have"
+      );
+      break;
+    }
+
     const context = await browser.newContext({ locale: "he-IL", userAgent: UA });
     const page = await context.newPage();
     let phaseYear = false;
@@ -105,16 +129,22 @@ async function doFetch(
     });
 
     try {
-      await page.goto(url, { waitUntil: "networkidle", timeout: 60_000 }).catch(() => {});
-      for (let i = 0; i < 14 && !buffer && !got403; i++) {
+      // domcontentloaded (NOT networkidle): the nadlan SPA polls continuously and
+      // never reaches networkidle, which made goto stall to its 60s timeout —
+      // the root cause of the ~100s run. deal-data is detected via the response
+      // interceptor + scroll regardless.
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      // Patient scroll — breaks the instant the interceptor fills buffer, and
+      // stops at the overall deadline.
+      for (let i = 0; i < SCROLL_ITERATIONS && !buffer && !got403 && elapsed() < WORKER_DEADLINE_MS; i++) {
         await page.mouse.wheel(0, 2500).catch(() => {});
-        await sleep(config.fetchDelayMs);
+        await sleep(SCROLL_DELAY_MS);
       }
       if (buffer && !got403) {
         pagesFetched = 1; // one 500-row buffer; the year filter only re-bounds it
         phaseYear = true;
         await driveYearFilter(page); // page signs its own request; we only click
-        await sleep(config.fetchDelayMs + 1500);
+        await sleep(2_000); // wait for the year-filtered re-fetch (meta.total_rows) — non-critical
       }
     } finally {
       await context.close().catch(() => {});
@@ -126,9 +156,10 @@ async function doFetch(
     }
     if (buffer) break;
 
-    consecutiveMisses += 1;
     log.info({ settlementId, attempt }, "no deal-data this attempt — retrying");
-    if (consecutiveMisses >= 2 && attempt < config.maxRetries) await sleep(config.cooldownMs);
+    // Tiny gap between attempts — NOT the 30s cooldown, which previously blocked
+    // a single in-flight request and blew the budget. Skip it near the deadline.
+    if (attempt < config.maxRetries && elapsed() < WORKER_DEADLINE_MS) await sleep(RETRY_GAP_MS);
   }
 
   if (!buffer) {
