@@ -110,6 +110,40 @@ async function doFetch(
     const page = await context.newPage();
     let phaseYear = false;
 
+    // ── TEMP DIAG (remove after VPS bootstrap diagnosis) ──────────────────────
+    // Capture what the page actually DOES on this Chromium: console output, page
+    // exceptions, failed requests, and every api.nadlan.gov.il call (was the
+    // deal-data XHR ever even ISSUED?). Read-only — no behaviour change.
+    const dApi: string[] = []; // api.nadlan.gov.il requests/responses, method+status
+    const dConsole: string[] = [];
+    const dPageErr: string[] = [];
+    const dFailed: string[] = [];
+    let dDealDataIssued = false;
+    page.on("console", (m) => {
+      if (dConsole.length < 50) dConsole.push(`${m.type()}: ${m.text()}`.slice(0, 300));
+    });
+    page.on("pageerror", (e) => {
+      if (dPageErr.length < 25) dPageErr.push(String(e?.message ?? e).slice(0, 300));
+    });
+    page.on("requestfailed", (req) => {
+      if (dFailed.length < 50)
+        dFailed.push(`${req.method()} ${req.url().slice(0, 120)} — ${req.failure()?.errorText ?? "?"}`);
+    });
+    page.on("request", (req) => {
+      const u = req.url();
+      if (u.includes("nadlan.gov.il") && /\/(deal-data|deal-info|token-verify|recaptcha|enterprise)/i.test(u)) {
+        if (u.includes("/deal-data")) dDealDataIssued = true;
+        log.info({ attempt, method: req.method(), url: u.slice(0, 160) }, "DIAG api request ISSUED");
+      }
+    });
+    page.on("response", (res) => {
+      const u = res.url();
+      if (u.includes("nadlan.gov.il") && /\/(deal-data|deal-info|token-verify|recaptcha|enterprise)/i.test(u)) {
+        if (dApi.length < 60) dApi.push(`${res.request().method()} ${res.status()} ${u.slice(0, 120)}`);
+      }
+    });
+    // ──────────────────────────────────────────────────────────────────────────
+
     page.on("response", async (res) => {
       const u = res.url();
       // Diagnostic: the SITE's own grecaptcha token is verified here. 200/ok ⇒ the
@@ -162,6 +196,57 @@ async function doFetch(
         await page.mouse.wheel(0, 2000).catch(() => {});
         await sleep(SCROLL_DELAY_MS);
       }
+
+      // ── TEMP DIAG snapshot — what did the SPA actually render here? ──────────
+      // Did the real nadlan app mount, or a blank/error/interstitial page? Is
+      // grecaptcha present? Did the browser functionally render (WebGL, fonts)?
+      try {
+        const snap = await page
+          .evaluate(() => {
+            const txt = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim();
+            let webgl = false;
+            try {
+              webgl = !!document.createElement("canvas").getContext("webgl");
+            } catch {
+              /* no webgl */
+            }
+            const w = window as unknown as { grecaptcha?: { enterprise?: unknown } };
+            return {
+              url: location.href,
+              title: document.title,
+              readyState: document.readyState,
+              bodyTextLen: txt.length,
+              bodyTextHead: txt.slice(0, 500), // detects "browser not supported"/JS-off notices
+              scripts: document.querySelectorAll("script").length,
+              filterBtns: document.querySelectorAll("button.filterBtn").length, // our deals-UI anchor
+              hasReactRoot: !!document.querySelector("#root, #app, [data-reactroot], main"),
+              hasGrecaptcha: !!w.grecaptcha,
+              hasGrecaptchaEnterprise: !!(w.grecaptcha && w.grecaptcha.enterprise),
+              webdriver: navigator.webdriver,
+              ua: navigator.userAgent,
+              lang: navigator.language,
+              webgl,
+            };
+          })
+          .catch((e) => ({ evalError: String(e) }));
+        log.info({ attempt, ...snap }, "DIAG page snapshot");
+      } catch (e) {
+        log.warn({ attempt, err: String(e) }, "DIAG snapshot failed");
+      }
+      log.info(
+        {
+          attempt,
+          dealDataIssued: dDealDataIssued,
+          apiCalls: dApi,
+          failedReqs: dFailed.slice(0, 25),
+          pageErrors: dPageErr,
+          consoleMsgs: dConsole.slice(0, 30),
+        },
+        "DIAG attempt wrap"
+      );
+      // Save a screenshot to /tmp so you can scp it off the VPS if the text is unclear.
+      await page.screenshot({ path: `/tmp/nadlan-diag-attempt${attempt}.png` }).catch(() => {});
+      // ────────────────────────────────────────────────────────────────────────
 
       // Year filter is a REFINEMENT after the first buffer is captured — it fires a
       // second deal-data the interceptor decodes (updates meta.total_rows). If it's
