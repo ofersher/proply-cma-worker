@@ -12,17 +12,18 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-// CP-FIX-1 — speed/safety budget. doFetch self-caps at WORKER_DEADLINE_MS so it
-// ALWAYS returns a 200 (with whatever it has) before the Vercel client's
-// CMA_WORKER_TIMEOUT_MS (90s) aborts → never a 499. Navigation uses
-// domcontentloaded (the nadlan SPA never reaches networkidle → that was the
-// up-to-60s goto stall). The scroll loop breaks the instant deal-data lands.
-// NOTE: config.fetchDelayMs / config.cooldownMs are no longer used here — the
-// 30s cooldown previously blocked a single in-flight request and blew the budget.
-const WORKER_DEADLINE_MS = 80_000; // hard overall budget across all attempts
-const SCROLL_ITERATIONS = 8; // was 14
-const SCROLL_DELAY_MS = 1500; // scroll poll wait (was config.fetchDelayMs = 2750)
-const RETRY_GAP_MS = 2000; // tiny gap between attempts (NOT the 30s cooldown)
+// PATIENCE budget. On a non-blocked IL IP the goal is rows>0, not a fast empty
+// return. domcontentloaded for a fast, deterministic nav (networkidle stalls goto
+// to 60s on this SPA), THEN wait up to DEAL_DATA_WAIT_MS per attempt for the SITE
+// to fire its own deal-data — it first bootstraps + runs grecaptcha + token-verify
+// (15-40s), so a short scroll returned before it ever fired. We gently scroll to
+// provoke and poll the interceptor-decoded buffer. Self-caps at WORKER_DEADLINE_MS
+// so it still returns before the caller's CMA_WORKER_TIMEOUT_MS (raise that to
+// ~100s on the Vercel side to match). config.fetchDelayMs / config.cooldownMs unused.
+const WORKER_DEADLINE_MS = 95_000; // hard overall budget across all attempts
+const DEAL_DATA_WAIT_MS = 45_000; // per-attempt patient wait for the deal-data XHR
+const SCROLL_DELAY_MS = 2000; // gentle human-like scroll cadence while waiting
+const RETRY_GAP_MS = 2000; // tiny gap between attempts
 
 export interface FetchResult {
   comparables: NadlanComparable[]; // near-subject, room+street+sqm matched, last 12mo
@@ -147,22 +148,30 @@ async function doFetch(
     });
 
     try {
-      // domcontentloaded (NOT networkidle): the nadlan SPA polls continuously and
-      // never reaches networkidle, which made goto stall to its 60s timeout —
-      // the root cause of the ~100s run. deal-data is detected via the response
-      // interceptor + scroll regardless.
+      // domcontentloaded for a fast, deterministic nav (networkidle stalls goto to
+      // its 60s timeout on this chatty SPA).
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-      // Patient scroll — breaks the instant the interceptor fills buffer, and
-      // stops at the overall deadline.
-      for (let i = 0; i < SCROLL_ITERATIONS && !buffer && !got403 && elapsed() < WORKER_DEADLINE_MS; i++) {
-        await page.mouse.wheel(0, 2500).catch(() => {});
+
+      // PATIENTLY wait for the SITE to fire its own deal-data (after it bootstraps
+      // + runs grecaptcha + token-verify), gently scrolling like a human to provoke
+      // it. We poll the interceptor-decoded buffer — equivalent to
+      // waitForResponse(/deal-data) but via our decode path, so an empty 200 never
+      // ends the wait early. We never craft the request; the page fires & signs it.
+      const attemptDeadline = Date.now() + DEAL_DATA_WAIT_MS;
+      while (!buffer && !got403 && Date.now() < attemptDeadline && elapsed() < WORKER_DEADLINE_MS) {
+        await page.mouse.wheel(0, 2000).catch(() => {});
         await sleep(SCROLL_DELAY_MS);
       }
+
+      // Year filter is a REFINEMENT after the first buffer is captured — it fires a
+      // second deal-data the interceptor decodes (updates meta.total_rows). If it's
+      // slow/empty the FIRST buffer is kept (the handler only overwrites buffer with
+      // a non-empty set), so a slow refinement never loses the captured deals.
       if (buffer && !got403) {
-        pagesFetched = 1; // one 500-row buffer; the year filter only re-bounds it
+        pagesFetched = 1;
         phaseYear = true;
         await driveYearFilter(page); // page signs its own request; we only click
-        await sleep(2_000); // wait for the year-filtered re-fetch (meta.total_rows) — non-critical
+        await sleep(3_000);
       }
     } finally {
       await context.close().catch(() => {});
