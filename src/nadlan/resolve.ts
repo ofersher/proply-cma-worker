@@ -1,50 +1,22 @@
-import { config } from "../config.js";
 import { log } from "../log.js";
-import { findSettlementId, canonicalName, normalizeHe } from "./cbs-settlements.js";
+import { findSettlementId, canonicalName } from "./cbs-settlements.js";
 import type { ResolvedSettlement } from "./types.js";
 
-// api.nadlan.gov.il hosts deal-info (www. → api.). Server-side, open, GovMap-free.
-const NADLAN_API_BASE = config.nadlanBaseUrl.includes("://www.")
-  ? config.nadlanBaseUrl.replace("://www.", "://api.")
-  : "https://api.nadlan.gov.il";
-
-interface DealInfoSettlement {
-  base_level: string;
-  setl_id: string;
-  setl_name: string;
-}
-
-/** Validate a settlement id nadlan-native (no GovMap, no reCAPTCHA). null on any failure. */
-async function dealInfoSettlement(id: string): Promise<DealInfoSettlement | null> {
-  try {
-    const res = await fetch(`${NADLAN_API_BASE}/deal-info`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Referer: `${config.nadlanBaseUrl}/`,
-        "User-Agent": "Mozilla/5.0",
-      },
-      body: JSON.stringify({ base_name: "setl_id", base_id: id }),
-      signal: AbortSignal.timeout(12_000),
-    });
-    if (!res.ok) return null;
-    const j = (await res.json()) as Partial<DealInfoSettlement>;
-    return j.base_level === "settlement" && j.setl_id && j.setl_name
-      ? { base_level: j.base_level, setl_id: j.setl_id, setl_name: j.setl_name }
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * Resolve a property to its nadlan settlement. Prefers an explicit `city` (e.g.
- * the property-card city field); falls back to scanning the free-text address.
- * Returns null when no known city matches (→ Source-2-only report) or when the
- * live deal-info name disagrees with the table (fail-safe against a bad code).
+ * Resolve a property to its nadlan settlement from the curated CBS table.
+ * Prefers an explicit `city` (the property-card city field); falls back to
+ * scanning the free-text address. Returns null only when no known city matches
+ * (→ Source-2-only report).
+ *
+ * We do NOT validate via api.nadlan.gov.il/deal-info: it now returns "Forbidden"
+ * for non-browser (bare Node fetch) requests, and gating the pull on it aborted
+ * before the headed browser — the part that loads the real page and lets the
+ * SITE mint its own token — ever ran. The CBS table IS the source of truth
+ * (every setl_id was verified live in CP3), and the browser pull itself confirms
+ * the id by returning that settlement's deals. No GovMap, no forging.
  *
  * Option B: settlement level only. Pagination/filter narrows to street/rooms/m²
- * locally — no GovMap, no search box.
+ * locally.
  */
 export async function resolveSettlement(input: {
   address?: string;
@@ -56,19 +28,9 @@ export async function resolveSettlement(input: {
     log.info({ hay }, "resolveSettlement: no city match in CBS table");
     return null;
   }
-  const info = await dealInfoSettlement(hit.id);
-  if (!info) {
-    log.warn({ id: hit.id }, "resolveSettlement: deal-info validation failed");
-    return null;
-  }
-  // Fail-safe: the live name must match the table's canonical name.
-  if (normalizeHe(info.setl_name) !== normalizeHe(canonicalName(hit.id) ?? "")) {
-    log.warn({ id: hit.id, live: info.setl_name }, "resolveSettlement: name mismatch — rejecting");
-    return null;
-  }
   return {
-    settlementId: info.setl_id,
-    settlementName: info.setl_name,
+    settlementId: hit.id,
+    settlementName: canonicalName(hit.id) ?? hit.matched,
     level: "settlement",
     matchedCity: hit.matched,
   };
